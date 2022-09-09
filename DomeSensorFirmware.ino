@@ -1,10 +1,26 @@
+///////////////////////////////////
+
+#if __has_include("build_version.h")
+#include "build_version.h"
+#endif
+
+#if __has_include("reeltwo_build_version.h")
+#include "reeltwo_build_version.h"
+#endif
+
+///////////////////////////////////
+
 // #define USE_DEBUG
+// #define USE_DOME_SENSOR_DEBUG
 #include "ReelTwo.h"
 #include "drive/DomeSensorRing.h"
 #include "core/EEPROMSettings.h"
 #include "core/StringUtils.h"
 #include "Adafruit_MCP4725.h"
 #include <EEPROM.h>
+
+//Define for Stef's full size dome sensor ring 
+//#define DOME_SENSOR_RING_FULL_SIZE
 
 ///////////////////////////////////
 // CONFIGURABLE OPTIONS
@@ -15,13 +31,16 @@
 #define CONSOLE_BUFFER_SIZE                 300
 #define COMMAND_BUFFER_SIZE                 256
 
+#ifndef DOME_SENSOR_RING_FULL_SIZE
 #define DAC_I2C                             0x60
+#endif
 #ifdef DAC_I2C
 #define DEFAULT_ANALOG_MIN_REFERENCE        0
 #define DEFAULT_ANALOG_MAX_REFERENCE        1023
 #endif
 
 #define POSITION_RESEND_INTERVAL            1000  // milliseconds
+#define TEST_DURATION_SECONDS               60
 
 ///////////////////////////////////
 
@@ -45,6 +64,9 @@ static uint32_t sWaitNextSerialCommand;
 static char sBuffer[CONSOLE_BUFFER_SIZE];
 static bool sCmdNextCommand;
 static char sCmdBuffer[COMMAND_BUFFER_SIZE];
+static uint32_t sEndTesting;
+static bool sTestOne;
+static unsigned sSensorMask;
 
 ///////////////////////////////////
 
@@ -58,12 +80,21 @@ DomeSensorRing sDomePosition;
 void setup()
 {
     REELTWO_READY();
+
     if (sSettings.read())
     {
+    #ifndef USE_DEBUG
+        Serial.begin(sSettings.fBaudRate);
+    #endif
+        PrintReelTwoInfo(Serial, "Dome Sensor");
         Serial.println(F("Settings Restored"));
     }
     else
     {
+    #ifndef USE_DEBUG
+        Serial.begin(sSettings.fBaudRate);
+    #endif
+        PrintReelTwoInfo(Serial, "Dome Sensor");
         Serial.println(F("First Time Settings"));
         sSettings.write();
         if (sSettings.read())
@@ -71,9 +102,6 @@ void setup()
             Serial.println(F("Readback Success"));
         }
     }
-#ifndef USE_DEBUG
-    Serial.begin(sSettings.fBaudRate);
-#endif
 
     SetupEvent::ready();
 #ifdef DAC_I2C
@@ -131,6 +159,21 @@ void processConfigureCommand(const char* cmd)
         Serial.print("MinAnalog="); Serial.println(sSettings.fMinAnalogOut);
         Serial.print("MaxAnalog="); Serial.println(sSettings.fMaxAnalogOut);
     #endif
+    }
+    else if (startswith(cmd, "#DPTEST"))
+    {
+        sTestOne = (*cmd == '1');
+        if (sTestOne)
+        {
+            Serial.print("Test one sensor at a time. ");
+        }
+        else
+        {
+            Serial.print("Testing. Rotate dome 360 degrees. ");
+        }
+        Serial.println("Test ends in "+String(TEST_DURATION_SECONDS)+" seconds or when all sensors have registered.");
+        sEndTesting = millis() + TEST_DURATION_SECONDS * 1000L;
+        sSensorMask = 0;
     }
     else if (startswith(cmd, "#DPBAUD"))
     {
@@ -198,6 +241,24 @@ bool processCommand(const char* cmd, bool firstCommand)
 
 ///////////////////////////////////
 
+static unsigned countChangedBits(unsigned a, unsigned b)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < 9; i++) 
+    {
+        if ((a & (1 << i)) != (b & (1 << i)))
+            n++;
+    }
+    return n;
+}
+
+static void printBinary(unsigned num, unsigned places)
+{
+    if (places)
+        printBinary(num >> 1, places-1);
+    Serial.print((num & 1) ? '1' : '0');
+}
+
 void loop()
 {
     static short sLastAngle = -1;
@@ -217,6 +278,45 @@ void loop()
                 sSettings.fMinAnalogOut, sSettings.fMaxAnalogOut), false);
         #endif
             sLastReport = millis();
+        }
+    }
+
+    if (sEndTesting > 0)
+    {
+        unsigned sensors = (~sDomePosition.readSensors() & 0x1FF);
+        sSensorMask |= sensors;
+        if (sTestOne && countChangedBits(0, sensors) > 1)
+        {
+            Serial.print("Test failed. These sensors are reading at the same time: ");
+            sEndTesting = 0;
+            for (unsigned i = 0; i < 9; i++)
+            {
+                if ((sensors & (1<<i)) != 0)
+                {
+                    Serial.print(i+1);
+                    Serial.print(" ");
+                }
+            }
+            Serial.println();
+        }
+        if (sSensorMask == 0x1FF)
+        {
+            Serial.println("All sensors registered. Ending test.");
+            sEndTesting = 0;
+        }
+        else if (sEndTesting < millis())
+        {
+            Serial.print("Test timeout. Following sensors did not register: ");
+            for (unsigned i = 0; i < 9; i++)
+            {
+                if ((sSensorMask & (1<<i)) == 0)
+                {
+                    Serial.print(i+1);
+                    Serial.print(" ");
+                }
+            }
+            Serial.println();
+            sEndTesting = 0;
         }
     }
     // append commands to command buffer
